@@ -60,6 +60,38 @@ def _file_node(path: str, **extra: Any) -> dict[str, Any]:
     return node
 
 
+def _whole_file_node(node_type: str, path: str) -> dict[str, Any]:
+    return _file_node(path, id=f"{node_type}:{path}", type=node_type)
+
+
+class WholeFileImportIndexTests(unittest.TestCase):
+    """Import recovery resolves every valid whole-file node type by path."""
+
+    def test_indexes_supported_whole_file_types(self) -> None:
+        nodes = [
+            _whole_file_node(node_type, f"project/{node_type}.txt")
+            for node_type in sorted(mbg.WHOLE_FILE_NODE_TYPES)
+        ]
+        index, warnings = mbg.build_whole_file_node_index(nodes)
+        self.assertEqual(warnings, [])
+        for node_type in mbg.WHOLE_FILE_NODE_TYPES:
+            path = f"project/{node_type}.txt"
+            self.assertEqual(index[path], f"{node_type}:{path}")
+
+    def test_prefers_file_and_rejects_child_or_malformed_nodes(self) -> None:
+        path = "config/app.json"
+        nodes = [
+            _whole_file_node("config", path),
+            _whole_file_node("file", path),
+            _file_node(path, id=f"table:{path}:users", type="table"),
+            _file_node("bad.json", id="config:not-bad.json", type="config"),
+        ]
+        index, warnings = mbg.build_whole_file_node_index(nodes)
+        self.assertEqual(index, {path: f"file:{path}"})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(f"selected file:{path}", warnings[0])
+
+
 # ── is_test_path ──────────────────────────────────────────────────────────
 
 class IsTestPathTests(unittest.TestCase):
@@ -1411,6 +1443,30 @@ class TestUaDirResolution(unittest.TestCase):
             (self.tmp / ".understand-anything" / "intermediate" / "assembled-graph.json").is_file()
         )
         self.assertFalse((self.tmp / ".ua" / "intermediate" / "assembled-graph.json").exists())
+
+
+class TestIncrementalEdgeCandidates(unittest.TestCase):
+    def test_preserves_only_current_normalized_dangling_edges(self) -> None:
+        source = _file_node("src/b.ts", id="demo:file:src/b.ts")
+        old_edge = {"source": source["id"], "target": "function:src/a.ts:old", "type": "calls"}
+        fresh_edges = [
+            {"source": source["id"], "target": "function:src/a.ts:lost", "type": "calls", "direction": "both", "weight": 0.6},
+            {"source": source["id"], "target": "function:src/a.ts:lost", "type": "calls", "direction": "both", "weight": 0.9},
+            {"source": "missing", "target": "function:src/a.ts:lost", "type": "calls"},
+        ]
+        candidates: list[dict[str, Any]] = []
+        assembled, _report = mbg.merge_and_normalize(
+            [{"nodes": [source], "edges": [old_edge]}, {"nodes": [], "edges": fresh_edges}],
+            current_edge_ids={id(edge) for edge in fresh_edges},
+            dangling_candidates=candidates,
+        )
+        self.assertEqual(assembled["edges"], [])
+        self.assertEqual(candidates, [{
+            "source": "file:src/b.ts", "target": "function:src/a.ts:lost", "type": "calls",
+            "direction": "bidirectional", "weight": 0.9,
+        }, {
+            "source": "missing", "target": "function:src/a.ts:lost", "type": "calls", "direction": "forward",
+        }])
 
 
 if __name__ == "__main__":
